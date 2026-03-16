@@ -502,6 +502,41 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_mlp_no_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cache=None,
+    ):
+        """Prepare MLP (prepare_mlp) without the all-reduce call when attention already ran communication.
+        """
+        if cache is not None:
+            self._context.cache = cache
+
+
+        if self.layer_scatter_modes.mlp_mode != ScatterMode.FULL:
+            raise RuntimeError(
+                f"prepare_mlp_no_all_reduce requires mlp_mode==FULL, "
+                f"got {self.layer_scatter_modes.mlp_mode}. "
+                f"Use regular prepare_mlp for this layer."
+            )
+
+        if hidden_states.shape[0] == 0:
+            residual = hidden_states
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+
+        return hidden_states, residual
+
+
+
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
@@ -710,7 +745,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            if residual is not None:
+                hidden_states, residual = layernorm(hidden_states, residual)
+            else:
+                # allow for no residual in return if it's empty
+                hidden_states = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -770,6 +809,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 and hasattr(layernorm, "forward_with_allreduce_fusion")
                 and get_global_server_args().enable_flashinfer_allreduce_fusion
                 and hidden_states.shape[0] <= 2048
+                and residual is not None
             ):
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
@@ -778,7 +818,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                if residual is not None:
+                    hidden_states, residual = layernorm(hidden_states, residual)
+                else:
+                    hidden_states = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod

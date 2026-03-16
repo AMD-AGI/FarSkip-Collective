@@ -86,6 +86,12 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+try:
+    from sglang.srt.layers.linear import AsyncRowParallelLinear
+except:
+    pass
+
+
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
@@ -463,7 +469,13 @@ class DeepseekV2MLP(nn.Module):
             tp_rank=tp_rank,
             tp_size=tp_size,
         )
-        self.down_proj = RowParallelLinear(
+        self.farskip_decoder = os.getenv('FARSKIP_OVERLAPPED_DECODER_LAYER', "0") == "1"
+        if self.farskip_decoder:
+            down_proj_module_class = AsyncRowParallelLinear
+        else:
+            down_proj_module_class = RowParallelLinear
+
+        self.down_proj = down_proj_module_class(
             intermediate_size,
             hidden_size,
             bias=False,
@@ -487,6 +499,7 @@ class DeepseekV2MLP(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        add_to_mlp_output: Optional[torch.Tensor] = None,
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
@@ -503,11 +516,20 @@ class DeepseekV2MLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(
-            x,
-            skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,
-        )
-        return x
+        # x, _ = self.down_proj(
+        #     x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+        # )
+        # return x
+        if self.farskip_decoder:
+            x, _, handle = self.down_proj(
+                x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter, add_to_linear_output=add_to_mlp_output
+            )
+            return x, handle
+        else:
+            x, _ = self.down_proj(
+                x, skip_all_reduce=should_allreduce_fusion or use_reduce_scatter
+            )
+            return x
 
 
 class MoEGate(nn.Module):
@@ -609,6 +631,7 @@ class DeepseekV2MoE(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
+        self.farskip_decoder = (os.getenv('FARSKIP_OVERLAPPED_DECODER_LAYER', "0") == "1")
         self.is_nextn = is_nextn
 
         if self.tp_size > config.n_routed_experts:
@@ -669,6 +692,12 @@ class DeepseekV2MoE(nn.Module):
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
         )
+        #  toggling perfect load-balancing for benchmarking
+        if get_bool_env_var("SGLANG_FORCE_LOAD_BALANCE"):
+            if self.layer_id == 3: # hard-coded print after first_k_dense_layers
+                print(f'Applying perfect load balancing (SGLANG_FORCE_LOAD_BALANCE=1)')
+            self.topk.forward_cuda = self.topk.forward_force_load_balancing
+            self.topk.forward_native = self.topk.forward_force_load_balancing
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
@@ -760,6 +789,7 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        add_to_shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._enable_a2a_moe:
             from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
@@ -782,6 +812,7 @@ class DeepseekV2MoE(nn.Module):
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
+                    add_to_shared_output,
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -793,6 +824,8 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
+        if self.farskip_decoder:
+            raise NotImplementedError("Dual stream is not implemented for farskip decoder layer")
 
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -825,6 +858,7 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
+        add_to_shared_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -844,6 +878,23 @@ class DeepseekV2MoE(nn.Module):
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        if shared_output is not None and self.farskip_decoder:
+            # shared output is all-reduced and returned separately from routed_experts
+            from sglang.srt.distributed.communication_op import async_tensor_model_parallel_all_reduce
+            shared_output, shared_output_async_row_parallel_handle = shared_output
+            assert shared_output_async_row_parallel_handle is None, 'AsyncRow... should not be returning a handle since reduce_results is false'
+
+            if add_to_shared_output is not None:
+                shared_output += add_to_shared_output
+
+            if os.getenv("SHARED_EXPERT_NO_REDUCE", "0") == "1":
+                shared_expert_handle = None
+            else:
+                shared_output, shared_expert_handle  = async_tensor_model_parallel_all_reduce(shared_output)
+
+        elif shared_output is not None and os.getenv('FARSKIP_REFERENCE_DECODER_LAYER', "0") == "1":
+            shared_output  = tensor_model_parallel_all_reduce(shared_output)
 
         if self._fuse_shared_experts_inside_sbo:
             shared_output = None
@@ -886,16 +937,30 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        if shared_output is not None:
-            final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-        return final_hidden_states
+
+        if self.farskip_decoder:
+            # here shared-expert activation communication syncs and the routed-expert activation communication starts
+            if shared_expert_handle is not None:
+                shared_expert_handle.wait()
+            routed_experts, routed_expert_handle = async_tensor_model_parallel_all_reduce(final_hidden_states)
+            return shared_output, routed_experts, routed_expert_handle, shared_expert_handle
+
+        elif os.getenv('FARSKIP_REFERENCE_DECODER_LAYER', "0") == "1":
+            # no asynchronous communication in reference implementation
+            routed_experts = tensor_model_parallel_all_reduce(final_hidden_states)
+            return shared_output, routed_experts
+
+        else:
+            if shared_output is not None:
+                final_hidden_states += shared_output
+            if (
+                self.tp_size > 1
+                and not should_allreduce_fusion
+                and not use_reduce_scatter
+                and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            return final_hidden_states
 
     def forward_cpu(
         self,
@@ -1207,6 +1272,19 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
         self.kv_cache_dtype = get_global_server_args().kv_cache_dtype
+        self.gated_attention = getattr(config, 'gated_attention', False) # support gated attention as in "Gated Attention for Large Language Models"
+        if self.gated_attention:
+            if self.layer_id == 0:
+                print('Creating a model layer with gated attention')
+            self.gate_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.num_heads * self.v_head_dim,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+        )
 
         # NOTE modification to rope_scaling must be done early enough, b/c e.g. Indexer needs it
         if rope_scaling:
@@ -1278,6 +1356,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             tp_size=attn_tp_size,
         )
         # O projection.
+        self.farskip_decoder = get_bool_env_var('FARSKIP_OVERLAPPED_DECODER_LAYER', "0")
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
@@ -1604,6 +1683,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        if self.gated_attention:
+            gate = torch.sigmoid(self.gate_proj(hidden_states)[0]) # drop bias
+        else:
+            gate = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -1709,11 +1792,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         v = kv[..., self.qk_nope_head_dim :]
 
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
-        return q, k, v, forward_batch
+        return q, k, v, forward_batch, gate
 
-    def forward_normal_core(self, q, k, v, forward_batch):
+    def forward_normal_core(self, q, k, v, forward_batch, gate=None):
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if self.gated_attention:
+            assert gate is not None
+            attn_output = attn_output * gate
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -1751,6 +1837,10 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        if self.gated_attention:
+            gate = torch.sigmoid(self.gate_proj(hidden_states)[0])
+        else:
+            gate = None
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         q_lora = None
@@ -1927,6 +2017,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             zero_allocator,
             positions,
             topk_indices,
+            gate,
         )
 
     def forward_absorb_core(
@@ -1939,6 +2030,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         zero_allocator,
         positions,
         topk_indices,
+        gate=None,
     ):
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -2089,6 +2181,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
+
+        if self.gated_attention:
+            assert gate is not None
+            attn_bmm_output = attn_bmm_output * gate
+
         output, _ = self.o_proj(attn_bmm_output)
 
         return output
@@ -2408,11 +2505,23 @@ class DeepseekV2AttentionMLA(nn.Module):
             dtype=q.dtype,
             device=q.device,
         )
-        attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
-            forward_batch.attn_backend.forward_metadata
-        )
-        cos_sin_cache = self.rotary_emb.cos_sin_cache
-        num_kv_split = forward_batch.attn_backend.num_kv_splits
+        if isinstance(forward_batch.attn_backend.forward_metadata, tuple):
+            attn_logits, _, kv_indptr, kv_indices, _, _, _ = (
+                forward_batch.attn_backend.forward_metadata
+            )
+        else:
+            metadata = forward_batch.attn_backend.forward_metadata
+            attn_logits = getattr(metadata, 'attn_logits', None)
+            kv_indptr = metadata.kv_indptr
+            kv_indices = metadata.kv_indices
+        if hasattr(self.rotary_emb, 'cos_sin_cache'):
+            cos_sin_cache = self.rotary_emb.cos_sin_cache
+        else:
+            cos_sin_cache = torch.cat([self.rotary_emb.cos_cache, self.rotary_emb.sin_cache], dim=-1)
+        # Backwards compatibility: try num_kv_splits first (old versions), then max_kv_splits (new versions)
+        num_kv_split = getattr(forward_batch.attn_backend, 'num_kv_splits', None)
+        if num_kv_split is None:
+            num_kv_split = forward_batch.attn_backend.max_kv_splits
         sm_scale = self.attn_mqa.scaling
         if attn_logits is None:
             attn_logits = torch.empty(
@@ -3115,6 +3224,342 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+class DeepseekV2ReferenceFarSkipDecoderLayer(DeepseekV2DecoderLayer):
+    """
+    Reference FarSkip-Collective implementation of Deepseek decoder layer - following the FarSkip-Collective connectivity but without explicit communication overlap
+
+    Connectivity
+    - attention block does not receive the routed expert outputs from the previous layer
+    - mlp block does not receive the attention outputs from the current layer
+
+    Debugging
+    - For debugging purposes one can disable the FarSkip-Collective connectivity and still use this decoder layer by setting FARSKIP_DISABLE_CONNECTIVITY=1
+    this will mathematically match the original DeepseekV2DecoderLayer
+    """
+    def __init__(
+            self,
+            config: PretrainedConfig,
+            layer_id: int,
+            quant_config: Optional[QuantizationConfig] = None,
+            moe_quant_config: Optional[QuantizationConfig] = None,
+            is_nextn: bool = False,
+            prefix: str = "",
+            alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            moe_quant_config=moe_quant_config,
+            is_nextn=is_nextn,
+            prefix=prefix,
+            alt_stream=alt_stream,
+        )
+        # can run the decoder class without farskip connectivity for debugging and correctness checking
+        self.reference_farskip = not os.getenv("FARSKIP_DISABLE_CONNECTIVITY", "0") == "1"
+        if self.reference_farskip:
+            self.self_attn.reduce_results = True  # reduce in layer not communicator
+        self.self_attn.o_proj.reduce_results = True
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> torch.Tensor:
+        quant_format = (
+            "mxfp4"
+            if (
+                _is_gfx95_supported
+                and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                is not None
+                and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+                is not None
+                and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
+            )
+            else (
+                "fp8"
+                if (
+                    _is_gfx95_supported
+                    and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                    is not None
+                    and getattr(
+                        self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None
+                    )
+                    is not None
+                    and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
+                    == getattr(torch, "float8_e4m3fn", None)
+                )
+                else ""
+            )
+        )
+        if self.reference_farskip:
+            if residual is None:
+                residual = hidden_states
+            hidden_states_no_routed = residual
+            attn_input, _ = self.layer_communicator.prepare_attn(
+                hidden_states_no_routed,
+                None,
+                forward_batch,
+                quant_format,
+            )
+            residual = hidden_states
+            mlp_input = hidden_states
+        else:
+            attn_input, residual = self.layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch,
+                quant_format,
+            )
+            mlp_input = None
+
+        attn_output = self.self_attn(
+            positions=positions,
+            hidden_states=attn_input,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+        if self.reference_farskip:
+            hidden_states = hidden_states + attn_output
+            residual = hidden_states
+            mlp_input, _ = self.layer_communicator.prepare_mlp_no_all_reduce(
+                mlp_input, None, forward_batch
+            )
+        else:
+            mlp_input, residual = self.layer_communicator.prepare_mlp(
+                attn_output, residual, forward_batch
+            )
+
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+
+        # For DP with padding, reduce scatter can be used instead of all-reduce.
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        if isinstance(self.mlp, DeepseekV2MLP):
+            gemm_output_zero_allocator = None
+            hidden_states = self.mlp(
+                mlp_input,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
+            if self.reference_farskip:
+                hidden_states = residual + hidden_states
+                residual = None
+        else:  #MoE
+            shared_output, routed_experts = self.mlp(
+                mlp_input,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+            )
+            if self.reference_farskip:
+                residual = residual + shared_output
+                hidden_states = residual + routed_experts
+            else:
+                hidden_states = shared_output + routed_experts
+
+        if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+
+        if not should_allreduce_fusion:
+            hidden_states, residual = self.layer_communicator.postprocess_layer(
+                hidden_states, residual, forward_batch
+            )
+        return hidden_states, residual
+
+
+class DeepseekV2FarSkipDecoderLayer(DeepseekV2DecoderLayer):
+        """
+        Overlapped FarSkip-Collective implementation of Deepseek decoder layer - uses asynchronous communication on a separate stream to harness the benefits enabled by FarSkip-Collective
+
+        Connectivity
+        - attention block does not receive the routed expert outputs from the previous layer
+        - mlp block does not receive the attention outputs from the current layer
+
+        Implementation details
+        - Attention block all-reduce is deferred to the shared-expert all-reduce in the MoE block and is overlapped with routed-expert computation
+        this is achieved by passing add_to_ffn_output unreduced activations to the MLP layer
+
+        - Routed expert all-reduce is overlapped with attention computation of the next layer by passing routed_handle to control synchronization
+
+        Debugging
+        - For debugging purposes one can disable the FarSkip-Collective connectivity and still use this decoder layer by setting FARSKIP_DISABLE_CONNECTIVITY=1
+        this will mathematically match the original DeepseekV2DecoderLayer
+        """
+        def __init__(
+                self,
+                config: PretrainedConfig,
+                layer_id: int,
+                quant_config: Optional[QuantizationConfig] = None,
+                moe_quant_config: Optional[QuantizationConfig] = None,
+                is_nextn: bool = False,
+                prefix: str = "",
+                alt_stream: Optional[torch.cuda.Stream] = None,
+        ) -> None:
+            super().__init__(
+                config=config,
+                layer_id=layer_id,
+                quant_config=quant_config,
+                moe_quant_config=moe_quant_config,
+                is_nextn=is_nextn,
+                prefix=prefix,
+                alt_stream=alt_stream,
+            )
+            self.farskip = not (os.getenv("FARSKIP_DISABLE_CONNECTIVITY", "0") == "1")
+            if self.farskip:
+                self.self_attn.reduce_results = False  # all-reduce is deferred to shared-experts all-reduce does not happen in the layer
+                self.self_attn.o_proj.reduce_results = False
+            else:
+                self.self_attn.reduce_results = True  # reduce happens in layer not post-layer communicator
+                self.self_attn.o_proj.reduce_results = True
+
+        def forward(
+                self,
+                positions: torch.Tensor,
+                hidden_states: torch.Tensor,
+                routed_handle,
+                forward_batch: ForwardBatch,
+                residual: Optional[torch.Tensor],
+                zero_allocator: BumpAllocator,
+                gemm_output_zero_allocator: BumpAllocator = None,
+        ) -> torch.Tensor:
+
+            quant_format = (
+                "mxfp4"
+                if (
+                        _is_gfx95_supported
+                        and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                        is not None
+                        and getattr(self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None)
+                        is not None
+                        and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype == torch.uint8
+                )
+                else (
+                    "fp8"
+                    if (
+                            _is_gfx95_supported
+                            and getattr(self.self_attn, "fused_qkv_a_proj_with_mqa", None)
+                            is not None
+                            and getattr(
+                        self.self_attn.fused_qkv_a_proj_with_mqa, "weight", None
+                    )
+                            is not None
+                            and self.self_attn.fused_qkv_a_proj_with_mqa.weight.dtype
+                            == getattr(torch, "float8_e4m3fn", None)
+                    )
+                    else ""
+                )
+            )
+            routed_experts = hidden_states
+            hidden_states_no_routed = residual
+            if residual is None:
+                attn_input, residual = self.layer_communicator.prepare_attn(
+                    hidden_states,
+                    None,
+                    forward_batch,
+                    quant_format,
+                )
+            elif self.farskip:
+                attn_input, residual = self.layer_communicator.prepare_attn(
+                    hidden_states_no_routed,
+                    None,
+                    forward_batch,
+                    quant_format,
+                )
+            else:
+                routed_handle.wait()
+                attn_input, residual = self.layer_communicator.prepare_attn(
+                    routed_experts,
+                    hidden_states_no_routed,
+                    forward_batch,
+                    quant_format,
+                )
+
+            attn_output = self.self_attn(
+                positions=positions,
+                hidden_states=attn_input,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+            if self.farskip:
+                if routed_handle is not None:
+                    routed_handle.wait()
+                    residual = residual + routed_experts
+                    mlp_input = residual
+                else:
+                    mlp_input = residual  # MLP / first layer case
+            else:
+                residual = residual + attn_output
+                mlp_input = residual
+
+            mlp_input, _ = self.layer_communicator.prepare_mlp_no_all_reduce(
+                mlp_input, None, forward_batch
+            )
+
+            should_allreduce_fusion = (
+                self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                    forward_batch
+                )
+            )
+            assert not should_allreduce_fusion, "should_allreduce_fusion for FarSkip is not supported"
+
+            # For DP with padding, reduce scatter can be used instead of all-reduce.
+            use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
+            assert not use_reduce_scatter, "use_reduce_scatter for FarSkip is not supported"
+
+            if self.farskip:
+                add_to_ffn_output = attn_output # un-reduced attn-output is passed to be all-reduced with shared-expert
+            else:
+                add_to_ffn_output = None
+
+            if isinstance(self.mlp, DeepseekV2MLP):
+                gemm_output_zero_allocator = None
+                mlp_output, mlp_handle = self.mlp(
+                    mlp_input,
+                    forward_batch,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                    gemm_output_zero_allocator,
+                    add_to_ffn_output
+                )
+                if mlp_handle is not None:
+                    mlp_handle.wait()
+                else:
+                    print('[Warning] FarSkipDecoderLayer MLP handle is None')
+                hidden_states = residual + mlp_output
+                return hidden_states, None, None
+
+            elif isinstance(self.mlp, DeepseekV2MoE):
+                shared_experts, routed_experts, routed_handle, shared_handle = self.mlp(
+                mlp_input,
+                forward_batch,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+                gemm_output_zero_allocator,
+                add_to_ffn_output,
+                )
+                residual += shared_experts
+                hidden_states = routed_experts
+                return hidden_states, residual, routed_handle
+            else:
+                raise ValueError("Unsupported MLP type in FarSkipDecoderLayer")
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -3145,9 +3590,18 @@ class DeepseekV2Model(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = torch.cuda.Stream() if _is_cuda else None
+        self.farskip_decoder = os.getenv('FARSKIP_OVERLAPPED_DECODER_LAYER', "0") == "1"
+        if self.farskip_decoder:
+            decoder_layer_cls = DeepseekV2FarSkipDecoderLayer
+        elif os.getenv("FARSKIP_REFERENCE_DECODER_LAYER", "0") == "1":
+            decoder_layer_cls = DeepseekV2ReferenceFarSkipDecoderLayer
+        else:
+            decoder_layer_cls = DeepseekV2DecoderLayer
+
+
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: DeepseekV2DecoderLayer(
+            lambda idx, prefix: decoder_layer_cls(
                 config=config,
                 layer_id=idx,
                 quant_config=quant_config,
@@ -3283,33 +3737,76 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
-        for i in range(normal_start_layer, normal_end_layer):
-            with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
-                layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
+        routed_handle = None
+        if self.farskip_decoder:
+            for i in range(normal_start_layer, normal_end_layer):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    if i in self.layers_to_capture:
+                        raise NotImplementedError("TBO with FarSkip not implemented yet")
+                        aux_hidden_states.append(hidden_states + residual)
+
+                    layer = self.layers[i]
+                    hidden_states, residual, routed_handle = layer(
+                        positions,
+                        hidden_states,
+                        routed_handle, # additional input argument for handle
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                    )
+
+            if normal_end_layer != self.end_layer:
+                raise NotImplementedError("TBO with FarSkip not implemented yet")
+                hidden_states, residual, routed_handle = model_forward_maybe_tbo(
+                    layers=self.layers[normal_end_layer : self.end_layer],
+                    enable_tbo=True,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode,
+                    zero_allocator=zero_allocator,
+                )
+        else:
+            for i in range(normal_start_layer, normal_end_layer):
+                with get_global_expert_distribution_recorder().with_current_layer(i):
+                    if i in self.layers_to_capture:
+                        aux_hidden_states.append(hidden_states + residual)
+
+                    layer = self.layers[i]
+                    hidden_states, residual = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                    )
+            if normal_end_layer != self.end_layer:
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=self.layers[normal_end_layer : self.end_layer],
+                    enable_tbo=True,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode,
+                    zero_allocator=zero_allocator,
                 )
 
-        if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer : self.end_layer],
-                enable_tbo=True,
-                positions=positions,
-                forward_batch=forward_batch,
-                hidden_states=hidden_states,
-                residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
-                zero_allocator=zero_allocator,
-            )
+        # outside if else
+        if routed_handle is not None:
+            routed_handle.wait() # synchronize the final communication call
+            hidden_states = hidden_states + residual  # residual + shared + routed
+            residual = None
+
+        elif os.getenv("FARSKIP_REFERENCE_DECODER_LAYER", "0") == "1" and not os.getenv("FARSKIP_DISABLE_CONNECTIVITY", "0") == "1":
+            residual = None
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -3856,6 +4353,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                         continue
                     if _is_npu:
                         name = name.replace("weight_packed", "weight")
+                    if "self_attn" in name: # to load gated attention parameters correctly
+                        continue
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise

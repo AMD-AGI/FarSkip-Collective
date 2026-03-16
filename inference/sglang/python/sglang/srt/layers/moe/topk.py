@@ -415,6 +415,91 @@ class TopK(CustomOp):
                 expert_location_dispatch_info=expert_location_dispatch_info,
             )
 
+    def forward_force_load_balancing(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        num_token_non_padded: Optional[torch.Tensor] = None,
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+    ) -> TopKOutput:
+        """
+        Forces perfect load balancing across experts using round-robin
+        skips router logits and distributes tokens evenly to all experts for benchmarking.
+        helpful when testing with random weights.
+        """
+        # Determine expected output format same logic as forward_cuda
+        if self.topk_config.output_format is not None:
+            output_format = self.topk_config.output_format
+        elif get_moe_runner_backend().is_triton_kernels():
+            output_format = TopKOutputFormat.TRITON_KERNEL
+        elif (
+            get_moe_runner_backend().is_flashinfer_trtllm()
+            or get_moe_runner_backend().is_flashinfer_mxfp4()
+        ):
+            output_format = TopKOutputFormat.BYPASSED
+        else:
+            output_format = TopKOutputFormat.STANDARD
+
+        # Only support StandardTopKOutput for now
+        if output_format == TopKOutputFormat.TRITON_KERNEL:
+            raise NotImplementedError(
+                "Force load balancing not supported for TRITON_KERNEL output format"
+            )
+        if output_format == TopKOutputFormat.BYPASSED:
+            raise NotImplementedError(
+                "Force load balancing not supported for BYPASSED output format"
+            )
+
+        num_tokens = hidden_states.shape[0]
+        num_experts = router_logits.shape[1]
+        top_k_routed = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            # round-robin assignment
+            # Token 0: [expert 0, expert 1, ...]
+            # Token 1: [expert k, expert k+1, ...]
+            all_assignments = torch.arange(
+                num_tokens * top_k_routed, device=hidden_states.device
+            )
+            topk_ids = (all_assignments % num_experts).view(num_tokens, top_k_routed).to(torch.int32)
+
+            # Uniform weights for all selected experts
+            topk_weights = torch.ones(
+                num_tokens, top_k_routed, dtype=torch.float32, device=hidden_states.device
+            ) / top_k_routed
+
+            if self.topk_config.num_fused_shared_experts > 0:
+                # Shared experts process all tokens, assigned IDs beyond num_experts
+                shared_ids = torch.randint(
+                    low=num_experts,
+                    high=num_experts + self.topk_config.num_fused_shared_experts,
+                    size=(num_tokens, self.topk_config.num_fused_shared_experts),
+                    dtype=torch.int32,
+                    device=hidden_states.device,
+                )
+                topk_ids = torch.cat([topk_ids, shared_ids], dim=1)
+
+                # Uniform weights for shared experts
+                shared_weights = torch.ones(
+                    num_tokens,
+                    self.topk_config.num_fused_shared_experts,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
+                )
+                topk_weights = torch.cat([topk_weights, shared_weights], dim=1)
+
+            # Mask padding region (no routing beyond num_token_non_padded)
+            if num_token_non_padded is not None:
+                indices = torch.arange(num_tokens, device=topk_ids.device)
+                topk_ids[indices >= num_token_non_padded, :] = -1
+
+        get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+
+        return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(

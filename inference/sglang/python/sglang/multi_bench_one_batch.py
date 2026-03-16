@@ -1,8 +1,16 @@
 """
-Benchmark the latency of running a single static batch without a server.
+Benchmark the latency of running a single static batch without a server extended to multi-node execution from bench_one_batch.py
 
-This script does not launch a server and uses the low-level APIs.
-It accepts server arguments (the same as launch_server.py) and benchmark arguments (e.g., batch size, input lengths).
+This script supports multi-node execution using environment variables:
+- RANK: Node rank (0, 1, 2, ...)
+- MASTER_ADDR: Master address (e.g., "192.168.1.100:29500")
+
+Key changes from bench_one_batch.py:
+1. Reads RANK env var to determine node_rank
+2. Reads MASTER_ADDR env var to set dist_init_addr
+3. Only spawns workers for the current node (not all workers)
+4. Passes separate gpu_id (local) and tp_rank (global) to workers
+5. tp_rank is global across all nodes, gpu_id is local (0-7 per node)
 
 # Usage (latency test)
 ## with dummy weights:
@@ -80,7 +88,6 @@ from sglang.srt.utils import (
     is_cuda_alike,
     is_xpu,
     kill_process_tree,
-    maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
@@ -565,9 +572,18 @@ def latency_test_run_once(
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
+    # TODO: Added global barrier to sync all nodes before decode (fixes 2-node CUDA graph issue)
+    # Without this, nodes can get out of sync during warmup/init and CUDA graph replay deadlocks
+    if model_runner.server_args.nnodes > 1:
+        import torch.distributed as dist
+        synchronize(device)  # Sync local GPU first
+        if dist.is_initialized():
+            dist.barrier()  # Then sync across all ranks/nodes
+
     decode_latencies = []
     profile_step_of_interest = output_len // 2
     enable_profile_decode = profile and profile_stage in ["all", "decode"]
+    rank_print(f"Starting decode loop, output_len={output_len}, iterations={output_len-1}")
     for i in range(output_len - 1):
         synchronize(device)
         profiler = None
@@ -735,6 +751,17 @@ def latency_test(
 def main(server_args, bench_args):
     server_args.cuda_graph_max_bs = max(bench_args.batch_size)
 
+    node_rank = int(os.environ.get("RANK", "0"))
+    master_addr = os.environ.get("MASTER_ADDR", None)
+
+    server_args.node_rank = node_rank
+
+    if master_addr:
+        server_args.dist_init_addr = master_addr
+        print(f"Node {node_rank}: Using MASTER_ADDR={master_addr}")
+
+    print(f"Node {node_rank}: tp_size={server_args.tp_size}, nnodes={server_args.nnodes}")
+
     _set_envs_and_config(server_args)
 
     if server_args.model_path:
@@ -753,26 +780,42 @@ def main(server_args, bench_args):
     if server_args.tp_size == 1:
         work_func(server_args, port_args, bench_args, 0, 0)
     else:
+        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
+        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+
+        tp_rank_range = range(
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+        )
+
+        print(f"Node {node_rank}: Spawning workers for tp_ranks {list(tp_rank_range)}")
+
         workers = []
-        for tp_rank in range(server_args.tp_size):
-            with maybe_reindex_device_id(tp_rank) as gpu_id:
-                proc = multiprocessing.Process(
-                    target=work_func,
-                    args=(
-                        server_args,
-                        port_args,
-                        bench_args,
-                        gpu_id,
-                        tp_rank,
-                    ),
-                )
-                proc.start()
-                workers.append(proc)
+        for tp_rank in tp_rank_range:
+            gpu_id = tp_rank % tp_size_per_node
+
+            print(f"Node {node_rank}: Launching worker tp_rank={tp_rank}, gpu_id={gpu_id}")
+
+            proc = multiprocessing.Process(
+                target=work_func,
+                args=(
+                    server_args,
+                    port_args,
+                    bench_args,
+                    gpu_id,
+                    tp_rank,
+                ),
+            )
+            proc.start()
+            workers.append(proc)
 
         for proc in workers:
             proc.join()
+            print(f"Node {node_rank}: Worker {proc.pid} exited with code: {proc.exitcode}", flush=True)
+            if proc.exitcode != 0:
+                print(f"Node {node_rank}: WARNING - Worker {proc.pid} failed with exit code {proc.exitcode}", flush=True)
 
-        proc.terminate()
+
 
 
 if __name__ == "__main__":
