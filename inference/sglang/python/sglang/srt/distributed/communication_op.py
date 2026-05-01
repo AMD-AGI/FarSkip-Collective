@@ -1,4 +1,6 @@
-
+# Modifications Copyright © 2026 Advanced Micro Devices, Inc.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# Adapted from SGLang (https://github.com/sgl-project/sglang), Copyright 2023-2024 SGLang Team.
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
 from typing import Any, Dict, Optional, Union, Tuple

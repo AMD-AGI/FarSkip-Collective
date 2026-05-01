@@ -1,6 +1,6 @@
-MIT License
+Copyright © 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-Copyright (c) 2026 AMD-AGI
+MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +19,16 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+--------------------------------------------------------------------------------
+Third-Party Software and Licenses
+
+This project uses or references the following third-party projects:
+
+1. SGLang
+   - License: Apache License 2.0
+   - Repository: https://github.com/sgl-project/sglang
+
+User must comply with the respective licenses of these third-party projects when using or distributing this software.
+
+--------------------------------------------------------------------------------
