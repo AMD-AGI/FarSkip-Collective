@@ -1,12 +1,24 @@
 # FarSkip-Collective
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![arXiv](https://img.shields.io/badge/arXiv-2511.11505-b31b1b.svg)](https://arxiv.org/abs/2511.11505) 
+
 
 ## Overview
-FarSkip-Collective models modify the Mixture of Experts (MoE) architecture to enable significant communication-computation overlap while achieving performance comparable to the original MoEs.
-This approach accelerates model training and inference, and unlocks sparser and larger MoE architectures on GPUs.
+FarSkip-Collective models modify the Mixture of Experts (MoE) architecture to enable native communication-computation overlap while achieving performance comparable to the original MoE architecture.
+By significantly reducing exposed communication overhead, the architecture unlocks higher hardware utilization for sparser and larger MoE architectures on GPUs.
+This repo is based on the research described in [FarSkip-Collective: Unhobbling Blocking Communication in Mixture of Experts Models](https://arxiv.org/abs/2511.11505).
 
-This repo contains the code of the approach described in [FarSkip-Collective: Unhobbling Blocking Communication in Mixture of Experts Models](https://arxiv.org/abs/2511.11505).
+FarSkip models modify the dependency graph of the MoE transformer block and use partial and outdated activations as the input to the MoE sub-blocks, which allows for overlapping of MoE communication.
+The accuracy of the FarSkip-Collective architecture has been validated for large-scale MoEs at the 100B+ parameter scale and with large-scale pre-training ablations.
 
-## Setup
+We provide separate implementations for optimized training and inference below. The training is implemented with the [Primus](https://github.com/AMD-AGI/Primus) framework + MegatronLM backend and follows the details in Primus `dev/farskip` branch [link](https://github.com/AMD-AGI/Primus/tree/dev/farskip).
+The inference engine is implemented with SGLang and follows the setup we describe below.
+
+For training, we provide overlapped and reference implementations for FarSkip-Collective. The main implementation is the optimized overlapped implementation that enables communication overlapping in the forward and backward passes.
+The reference implementation is used for debugging and prototyping. When activating deterministic sub-layer paths, the reference and overlapped implementations result in bit-exact forward passes.
+
+
+
+## Setup (Inference)
 1. Pull the LMSYS AMD SGLang Docker image (MI30x / MI325x machines)
 ```bash
 docker pull lmsysorg/sglang:v0.5.6-rocm700-mi30x # sha256:1e4030610e482c9f09c29309b223d2ad1f1ed4c56c2e00d5c352f5673a860770
@@ -34,7 +46,7 @@ docker run \
 ```
 
 ## Usage
-Under the `inference` directory we provide SGLang implementation of FarSkip
+Under the `inference` directory we provide SGLang implementation of FarSkip.
 ### Single-node
 For a single-node inference test with DeepSeek-V3 modified with FarSkip-Collective connectivity, inside the Docker container, run:
 ```bash
@@ -65,7 +77,7 @@ RANK=1 MASTER_ADDR=<node0_ip>:<port> MODE=FARSKIP bash scripts/multinode_benchma
 
 ### Additional details
 For debugging purposes to test the `DeepseekV2FarSkipDecoderLayer` and `DeepseekV2ReferenceFarSkipDecoderLayer` decoder classes, you may set `FARSKIP_DISABLE_CONNECTIVITY=1`.
-This will still use the new corresponding FarSkip decoder classes but with the regular model connectivity which nullifies farskip (you can find more details under `deepseek_v2.py`).
+This will still use the new corresponding FarSkip decoder classes but with the regular model connectivity which nullifies FarSkip (you can find more details under `deepseek_v2.py`).
 
 
 ### Cite

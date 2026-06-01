@@ -1,0 +1,4 @@
+[submodule "training"]
+	path = training
+	url = https://github.com/AMD-AGI/Primus.git
+	branch = dev/farskip
