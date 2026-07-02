@@ -3495,20 +3495,31 @@ class DeepseekV2FarSkipDecoderLayer(DeepseekV2DecoderLayer):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
             )
+            # merge the routed residual add into the post_attention_layernorm (add_rmsnorm)
+            # fuse_residual_add = os.environ.get("FUSE_RESIDUAL_ADD", "0") == "1"
+            fuse_residual_add = True # hard-coded
             if self.farskip:
                 if routed_handle is not None:
                     routed_handle.wait()
-                    residual = residual + routed_experts
-                    mlp_input = residual
+                    if fuse_residual_add:
+                        mlp_input, residual = self.layer_communicator.prepare_mlp_no_all_reduce(
+                            routed_experts, residual, forward_batch
+                        )
+                    else:
+                        residual = residual + routed_experts
+                        mlp_input, _ = self.layer_communicator.prepare_mlp_no_all_reduce(
+                            residual, None, forward_batch
+                        )
                 else:
                     mlp_input = residual  # MLP / first layer case
+                    mlp_input, _ = self.layer_communicator.prepare_mlp_no_all_reduce(
+                        mlp_input, None, forward_batch
+                    )
             else:
                 residual = residual + attn_output
-                mlp_input = residual
-
-            mlp_input, _ = self.layer_communicator.prepare_mlp_no_all_reduce(
-                mlp_input, None, forward_batch
-            )
+                mlp_input, _ = self.layer_communicator.prepare_mlp_no_all_reduce(
+                    residual, None, forward_batch
+                )
 
             should_allreduce_fusion = (
                 self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
