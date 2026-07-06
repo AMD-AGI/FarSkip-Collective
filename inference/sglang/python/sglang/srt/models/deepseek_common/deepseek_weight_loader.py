@@ -204,6 +204,8 @@ class DeepseekV2WeightLoaderMixin:
                         continue
                     if _is_npu:
                         name = name.replace("weight_packed", "weight")
+                    if "self_attn" in name: # to load gated attention parameters correctly
+                        continue
                     # We have mlp.experts[0].gate_proj in the checkpoint.
                     # Since we handle the experts below in expert_params_mapping,
                     # we need to skip here BEFORE we update the name, otherwise

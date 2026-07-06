@@ -37,6 +37,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_gather_into_tensor,
     attn_tp_reduce_scatter_tensor,
     dp_gather_partial,
+    dp_gather_replicate,
     dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_cp_rank,
@@ -551,6 +552,56 @@ class LayerCommunicator:
             context=self._context,
         )
 
+    def prepare_mlp_no_all_reduce(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cache=None,
+    ):
+        """Prepare MLP (prepare_mlp) without the all-reduce call when attention already ran communication.
+        """
+        if cache is not None:
+            self._context.cache = cache
+
+        if self.layer_scatter_modes.mlp_mode != ScatterMode.FULL:
+            raise RuntimeError(
+                f"prepare_mlp_no_all_reduce requires mlp_mode==FULL, "
+                f"got {self.layer_scatter_modes.mlp_mode}. "
+                f"Use regular prepare_mlp for this layer."
+            )
+
+        ctx = self._context
+        if ctx.attn_dp_size != 1:
+            # dp-attention: TP all-reduce already done by attention (reduce_results=True),
+            # but TP_ATTN_FULL != FULL, so we still need the DP gather before MLP.
+            if ctx.attn_tp_size == 1:
+                # Layernorm before gather: data is still local-sized
+                if hidden_states.shape[0] != 0:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+                hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+            else:
+                # Gather first (TP_ATTN_FULL -> FULL), then layernorm
+                hidden_states, local_hidden_states = get_global_dp_buffer(), hidden_states
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+                if hidden_states.shape[0] != 0:
+                    hidden_states = self.post_attention_layernorm(hidden_states)
+            return hidden_states, residual
+
+        if hidden_states.shape[0] == 0:
+            residual = hidden_states
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+
+        return hidden_states, residual
+
     def postprocess_layer(
         self,
         hidden_states: torch.Tensor,
@@ -755,7 +806,11 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         # TODO move these `if shape != 0` into LayerNorm itself
         if hidden_states.shape[0] != 0:
-            hidden_states, residual = layernorm(hidden_states, residual)
+            if residual is not None:
+                hidden_states, residual = layernorm(hidden_states, residual)
+            else:
+                # allow for no residual in return if it's empty
+                hidden_states = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod
@@ -809,7 +864,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
         else:
             if apply_flashinfer_allreduce_fusion(hidden_states.shape[0]) and hasattr(
                 layernorm, "forward_with_allreduce_fusion"
-            ):
+            ) and residual is not None:
                 hidden_states, residual = layernorm.forward_with_allreduce_fusion(
                     hidden_states, residual
                 )
@@ -817,7 +872,10 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states = tensor_model_parallel_all_reduce(hidden_states)
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
-                hidden_states, residual = layernorm(hidden_states, residual)
+                if residual is not None:
+                    hidden_states, residual = layernorm(hidden_states, residual)
+                else:
+                    hidden_states = layernorm(hidden_states, residual)
         return hidden_states, residual
 
     @staticmethod

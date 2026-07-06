@@ -98,6 +98,10 @@ class DeepseekMHAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        if self.gated_attention:
+            gate = torch.sigmoid(self.gate_proj(hidden_states)[0]) # drop bias
+        else:
+            gate = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -243,7 +247,7 @@ class DeepseekMHAForwardMixin:
         v = kv[..., self.qk_nope_head_dim :]
 
         k = self._concat_and_cast_mha_k(k_nope, k_pe, forward_batch)
-        return q, k, v, forward_batch
+        return q, k, v, forward_batch, gate
 
     def forward_normal_core(
         self: DeepseekV2AttentionMLA,
@@ -251,9 +255,13 @@ class DeepseekMHAForwardMixin:
         k: torch.Tensor,
         v: torch.Tensor,
         forward_batch: ForwardBatch,
+        gate=None,
     ) -> torch.Tensor:
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+        if self.gated_attention:
+            assert gate is not None
+            attn_output = attn_output * gate
         output, _ = self.o_proj(attn_output)
         return output
 
