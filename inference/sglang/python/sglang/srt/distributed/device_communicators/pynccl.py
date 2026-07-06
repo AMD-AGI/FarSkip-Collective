@@ -1,6 +1,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/device_communicators/pynccl.py
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Optional, Union
 
@@ -113,7 +114,11 @@ class PyNcclCommunicator:
             self.comm: ncclComm_t = self.nccl.ncclCommInitRank(
                 self.world_size, self.unique_id, self.rank
             )
-            self.stream = torch.cuda.Stream()
+            # When the FarSkip overlapped decoder layer is enabled set communication on high priority stream for better overlap
+            comm_high_priority =  os.environ.get("FARSKIP_OVERLAPPED_DECODER_LAYER", "0")
+            self.stream = torch.cuda.Stream(
+                priority=-1 if comm_high_priority == "1" else 0
+            )
 
             # A small all_reduce for warmup.
             data = torch.zeros(1, device=device)
