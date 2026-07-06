@@ -459,6 +459,12 @@ class DeepseekV2MoE(nn.Module):
                 else None
             ),
         )
+        #  toggling perfect load-balancing for benchmarking
+        if get_bool_env_var("SGLANG_FORCE_LOAD_BALANCE"):
+            if self.layer_id == 3: # hard-coded print after first_k_dense_layers
+                print(f'Applying perfect load balancing (SGLANG_FORCE_LOAD_BALANCE=1)')
+            self.topk.forward_cuda = self.topk.forward_force_load_balancing
+            self.topk.forward_native = self.topk.forward_force_load_balancing
 
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
