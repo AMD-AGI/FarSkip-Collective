@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -219,6 +220,11 @@ class TritonAttnBackend(AttentionBackend):
         else:
             SCHEDULE_SEQ = triton.next_power_of_2(num_seq)
 
+        force_splits = int(os.environ.get("SGLANG_FORCE_KV_SPLITS", "0"))
+        force_seqlen_threshold = int(
+            os.environ.get("SGLANG_FORCE_KV_SPLITS_MIN_SEQ", "512")
+        )
+
         get_num_kv_splits_triton[(1,)](
             num_kv_splits,
             seq_lens,
@@ -228,8 +234,17 @@ class TritonAttnBackend(AttentionBackend):
             self.num_kv_head,
             self.max_kv_splits,
             self.device_core_count,
+            force_splits,
+            force_seqlen_threshold,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
+        if not getattr(self, "_kv_splits_realized_logged", False):
+            print(
+                f"[KV_SPLITS_REALIZED] realized_unique={torch.unique(num_kv_splits).tolist()} "
+                f"force_splits={force_splits} max_seq_len={int(seq_lens.max())}",
+                flush=True,
+            )
+            self._kv_splits_realized_logged = True
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
@@ -1213,6 +1228,8 @@ def get_num_kv_splits_triton(
     num_kv_head,
     max_kv_splits,
     device_core_count,
+    force_splits,
+    force_seqlen_threshold,
     MAX_NUM_SEQ: tl.constexpr,
 ):
     # TODO: this method is tunable, we need more online serving data to tune it
@@ -1243,6 +1260,11 @@ def get_num_kv_splits_triton(
     max_kv_splits_2 = tl.minimum(
         tl.cdiv(ext_device_core_count, token_grid), max_kv_splits
     )
+    if force_splits > 0:
+        if max_seq_len > force_seqlen_threshold:
+            max_kv_splits_2 = tl.minimum(force_splits, max_kv_splits)
+        else:
+            max_kv_splits_2 = tl.minimum(max_kv_splits_2, 16)
     kv_chunk_size_2 = tl.cdiv(max_seq_len, max_kv_splits_2)
 
     num_kv_splits = tl.maximum(

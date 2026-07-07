@@ -2059,7 +2059,11 @@ class ServerArgs:
 
     def _handle_amd_specifics(self):
         if is_hip():
+            import os as _os
             self.triton_attention_num_kv_splits = 16
+            if int(_os.environ.get("SGLANG_FORCE_KV_SPLITS", "0")) > 0:
+                self.triton_attention_num_kv_splits = 128
+                print(f"[FORCE_KV_SPLITS] triton_attention_num_kv_splits={self.triton_attention_num_kv_splits} (SGLANG_FORCE_KV_SPLITS on)", flush=True)
 
     def _handle_grammar_backend(self):
         if self.grammar_backend is None:
