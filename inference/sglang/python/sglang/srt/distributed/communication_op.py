@@ -106,6 +106,29 @@ def async_tensor_model_parallel_all_reduce(
     return input_, CustomNCCLWork(pynccl_stream, input_)
 
 
+def async_reduce_scatter(
+    output_: torch.Tensor, input_: torch.Tensor
+) -> CustomNCCLWork:
+    """Async reduce-scatter on the pynccl comm stream, mirroring
+    async_tensor_model_parallel_all_reduce
+
+    Assumes tp_world == attn_dp, i.e. the simple
+    dp_reduce_scatter_tensor path no mixed partial dp-tp
+    """
+    tp_group = get_tp_group()
+    current_stream = torch.cuda.current_stream()
+    pynccl_stream = tp_group.pynccl_comm.stream
+    pynccl_stream.wait_stream(current_stream)
+
+    with tp_group.pynccl_comm.change_state(enable=True, stream=pynccl_stream):
+        tp_group.pynccl_comm.reduce_scatter(output_, input_)
+
+    handle = CustomNCCLWork(pynccl_stream, output_)
+    handle.is_reduce_scatter = True
+    handle.input_ref = input_
+    return handle
+
+
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
