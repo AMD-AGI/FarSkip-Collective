@@ -520,6 +520,71 @@ def dp_gather_replicate(
     _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=False)
 
 
+def dp_gather_partial_async(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+):
+    """Async variant of dp_gather_partial (is_partial=True) for float hidden
+    states. Returns a CustomNCCLWork whose .wait() yields the gathered global
+    tensor; the collective overlaps compute issued on the current stream between
+    this call and the wait().
+
+    SUM_LEN path: prep (fill_/memcpy) runs on the current stream, then the
+    all-reduce is issued via async_tensor_model_parallel_all_reduce so it uses
+    the SAME kernel selection (custom/quick/pynccl) as the sync gather — keeping
+    numerics bit-identical to dp_gather_partial. Note custom/quick AR is
+    out-of-place, so the result tensor is whatever handle.wait() returns, NOT
+    necessarily the passed-in global_tokens; the caller must use the return.
+
+    MAX_LEN path: all-gather on the pynccl comm stream (not exercised under
+    CG-off/SUM_LEN). Only the float hidden-state gather is supported; the int
+    input-id gather keeps using the sync dp_gather_partial.
+    """
+    from sglang.srt.distributed.communication_op import (
+        CustomNCCLWork,
+        async_tensor_model_parallel_all_reduce,
+    )
+
+    assert local_tokens.is_contiguous()
+    assert global_tokens.is_contiguous()
+    assert local_tokens.dtype.is_floating_point
+
+    if forward_batch.dp_padding_mode.is_max_len():
+        tp_group = get_tp_group()
+        pynccl_comm = tp_group.pynccl_comm
+        current_stream = torch.cuda.current_stream()
+        pynccl_stream = pynccl_comm.stream
+        pynccl_stream.wait_stream(current_stream)
+        with pynccl_comm.change_state(enable=True, stream=pynccl_stream):
+            with torch.cuda.stream(pynccl_stream):
+                if get_attention_tp_size() == 1:
+                    pynccl_comm.all_gather(global_tokens, local_tokens)
+                else:
+                    if get_attention_tp_rank() != 0:
+                        local_tokens.fill_(0)
+                    scattered = local_tokens.tensor_split(get_attention_tp_size())[
+                        get_attention_tp_rank()
+                    ]
+                    get_attention_tp_group().reduce_scatter_tensor(
+                        scattered, local_tokens
+                    )
+                    pynccl_comm.all_gather(global_tokens, scattered)
+        return CustomNCCLWork(pynccl_stream, global_tokens)
+
+    local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
+    global_tokens.fill_(0)
+    if local_tokens.shape[0] > 0:
+        assert (
+            local_tokens.untyped_storage() is not global_tokens.untyped_storage()
+        ), "aliasing between global_tokens and local_tokens not allowed"
+        memcpy_triton(
+            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+        )
+    _, handle = async_tensor_model_parallel_all_reduce(global_tokens)
+    return handle
+
+
 def dp_scatter(
     local_tokens: torch.Tensor,  # output
     global_tokens: torch.Tensor,  # input
